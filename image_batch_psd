@@ -1,0 +1,393 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import fftpack
+from PIL import Image
+import time
+from tqdm import tqdm  # For progress bar
+
+def calculate_2d_psd(image):
+    """Calculate 2D power spectral density of an image."""
+    # Convert to grayscale if it's a color image
+    if len(image.shape) == 3:
+        image = np.mean(image, axis=2)
+    
+    # Apply Hann window to reduce edge effects
+    h_window = np.hanning(image.shape[0])
+    v_window = np.hanning(image.shape[1])
+    window = np.outer(h_window, v_window)
+    
+    # Apply window and compute FFT
+    windowed_img = image * window
+    
+    # Compute 2D FFT
+    f_transform = fftpack.fft2(windowed_img)
+    
+    # Shift zero frequency to center
+    f_transform_shifted = fftpack.fftshift(f_transform)
+    
+    # Calculate power spectrum (magnitude squared)
+    power_spectrum = np.abs(f_transform_shifted)**2
+    
+    return power_spectrum
+
+def process_image_folder(folder_path, resize_to=None, max_images=None):
+    """Process all images in a folder and calculate their PSDs without displaying them."""
+    # Get list of image files
+    image_files = []
+    for file in os.listdir(folder_path):
+        file_lower = file.lower()
+        if file_lower.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
+            image_files.append(os.path.join(folder_path, file))
+    
+    print(f"Found {len(image_files)} image files")
+    
+    # Limit number of images if specified
+    if max_images and len(image_files) > max_images:
+        print(f"Limiting analysis to {max_images} images")
+        image_files = image_files[:max_images]
+    
+    # Process each image
+    psds = []
+    start_time = time.time()
+    
+    # Use tqdm for progress bar
+    for img_path in tqdm(image_files, desc="Processing images"):
+        try:
+            # Load and potentially resize image
+            img = Image.open(img_path)
+            if resize_to:
+                img = img.resize(resize_to)
+            img_array = np.array(img)
+            
+            # Calculate PSD
+            psd = calculate_2d_psd(img_array)
+            psds.append(psd)
+            
+        except Exception as e:
+            print(f"Error processing {os.path.basename(img_path)}: {e}")
+    
+    elapsed_time = time.time() - start_time
+    print(f"Processed {len(psds)} images in {elapsed_time:.2f} seconds")
+    
+    return psds
+
+def create_psd_summary(psds):
+    """Create summary statistics from all PSDs."""
+    if not psds:
+        print("No PSDs to analyze.")
+        return None
+    
+    # Ensure all PSDs have the same shape
+    psd_shapes = [p.shape for p in psds]
+    if len(set(psd_shapes)) > 1:
+        print("Warning: PSDs have different shapes. Using first PSD shape as reference.")
+        ref_shape = psd_shapes[0]
+        # Filter PSDs to include only those with the reference shape
+        psds = [p for p, shape in zip(psds, psd_shapes) if shape == ref_shape]
+        print(f"Using {len(psds)} PSDs with shape {ref_shape}")
+    
+    # Stack PSDs into a 3D array
+    psd_stack = np.stack(psds)
+    
+    # Calculate statistics
+    avg_psd = np.mean(psd_stack, axis=0)
+    std_psd = np.std(psd_stack, axis=0)
+    min_psd = np.min(psd_stack, axis=0)
+    max_psd = np.max(psd_stack, axis=0)
+    
+    return {
+        'average': avg_psd,
+        'std_dev': std_psd,
+        'min': min_psd,
+        'max': max_psd,
+        'count': len(psds)
+    }
+
+def analyze_dominant_frequencies(avg_psd, n_peaks=10):
+    """Find the dominant frequency components in the average PSD."""
+    # Create coordinate grid
+    h, w = avg_psd.shape
+    y_coords, x_coords = np.ogrid[:h, :w]
+    
+    # Get coordinates relative to center (DC component)
+    center_y, center_x = h // 2, w // 2
+    y_rel = y_coords - center_y
+    x_rel = x_coords - center_x
+    
+    # Calculate distance from center (frequency magnitude)
+    dist_from_center = np.sqrt(y_rel**2 + x_rel**2)
+    
+    # Mask out the DC component (center point and immediate surroundings)
+    mask = np.ones_like(avg_psd, dtype=bool)
+    # Create a small region around the center to exclude (DC component and very low frequencies)
+    dc_radius = min(5, h//20, w//20)  # Adaptive radius based on image size
+    y_dist = np.abs(y_coords - center_y)
+    x_dist = np.abs(x_coords - center_x)
+    mask[y_dist < dc_radius, :] = False
+    mask[:, x_dist < dc_radius] = False
+    
+    masked_psd = avg_psd.copy()
+    masked_psd[~mask] = 0
+    
+    # Find peak positions
+    flat_indices = np.argsort(masked_psd.flatten())[-n_peaks:]
+    peak_indices = np.unravel_index(flat_indices, avg_psd.shape)
+    
+    peaks = []
+    for y, x in zip(peak_indices[0], peak_indices[1]):
+        # Calculate frequency in cycles per image
+        freq_y = abs(y - center_y) / h
+        freq_x = abs(x - center_x) / w
+        
+        # Calculate angle (direction)
+        angle = np.arctan2(y - center_y, x - center_x) * 180 / np.pi
+        
+        # Calculate magnitude
+        magnitude = masked_psd[y, x]
+        
+        # Distance from center (frequency magnitude)
+        distance = dist_from_center[y, x]
+        
+        peaks.append({
+            'position': (y, x),
+            'freq_y': freq_y,
+            'freq_x': freq_x,
+            'angle': angle,
+            'magnitude': magnitude,
+            'distance': distance
+        })
+    
+    # Sort by magnitude
+    peaks.sort(key=lambda x: x['magnitude'], reverse=True)
+    
+    return peaks, center_y, center_x
+
+def visualize_psd_summary(summary):
+    """Create visualizations for the PSD summary."""
+    if not summary:
+        return
+    
+    # Plot average PSD as heatmap
+    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+    
+    # Average PSD
+    avg_log = np.log10(summary['average'] + 1)  # Add 1 to avoid log(0)
+    im0 = axes[0, 0].imshow(avg_log, cmap='viridis')
+    axes[0, 0].set_title('Average PSD (log scale)')
+    plt.colorbar(im0, ax=axes[0, 0])
+    
+    # Standard deviation
+    std_log = np.log10(summary['std_dev'] + 1)
+    im1 = axes[0, 1].imshow(std_log, cmap='plasma')
+    axes[0, 1].set_title('PSD Standard Deviation (log scale)')
+    plt.colorbar(im1, ax=axes[0, 1])
+    
+    # Max PSD
+    max_log = np.log10(summary['max'] + 1)
+    im2 = axes[1, 0].imshow(max_log, cmap='inferno')
+    axes[1, 0].set_title('Maximum PSD (log scale)')
+    plt.colorbar(im2, ax=axes[1, 0])
+    
+    # Coefficient of variation (std/mean) - shows relative variability
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cv = summary['std_dev'] / summary['average']
+        cv[~np.isfinite(cv)] = 0  # Handle division by zero
+    
+    im3 = axes[1, 1].imshow(cv, cmap='coolwarm', vmin=0, vmax=np.percentile(cv, 95))
+    axes[1, 1].set_title('Coefficient of Variation (std/mean)')
+    plt.colorbar(im3, ax=axes[1, 1])
+    
+    plt.tight_layout()
+    plt.savefig('psd_summary_heatmaps.png', dpi=300)
+    plt.show()
+    
+    # Find and visualize dominant frequencies
+    peaks, center_y, center_x = analyze_dominant_frequencies(summary['average'])
+    
+    plt.figure(figsize=(12, 10))
+    plt.imshow(avg_log, cmap='viridis')
+    
+    # Mark the center (DC component)
+    plt.plot(center_x, center_y, 'r+', markersize=15)
+    
+    # Plot the peak points
+    for i, peak in enumerate(peaks):
+        y, x = peak['position']
+        plt.plot(x, y, 'ro', markersize=8, alpha=0.7)
+        plt.text(x+5, y+5, f"{i+1}", color='white', fontsize=12, 
+                bbox=dict(facecolor='red', alpha=0.5))
+    
+    plt.colorbar(label='Log Power')
+    plt.title("Dominant Frequency Components")
+    
+    # Add annotations for significant peaks
+    significant_peaks = peaks[:5]  # Top 5 peaks
+    peak_info = "\n".join([
+        f"Peak {i+1}: Freq=({p['freq_x']:.3f}, {p['freq_y']:.3f}), "
+        f"Angle={p['angle']:.1f}°, Dist={p['distance']:.1f}"
+        for i, p in enumerate(significant_peaks)
+    ])
+    
+    plt.figtext(0.5, 0.01, peak_info, ha="center", fontsize=10, 
+               bbox={"facecolor":"orange", "alpha":0.5, "pad":5})
+    
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.15)  # Make room for the text
+    plt.savefig('dominant_frequencies.png', dpi=300)
+    plt.show()
+    
+    return peaks
+
+def analyze_directional_patterns(peaks):
+    """Analyze directional patterns in the frequency domain."""
+    if not peaks:
+        return
+    
+    # Extract angles and convert to 0-180 range (frequencies have 180° symmetry)
+    angles = [(p['angle'] % 360) for p in peaks]
+    angles = [a if a <= 180 else a - 180 for a in angles]
+    
+    # Create histogram of angles
+    bins = 18  # 10° bins
+    hist, bin_edges = np.histogram(angles, bins=bins, range=(0, 180))
+    
+    # Calculate bin centers for plotting
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # Plot directional histogram
+    plt.figure(figsize=(12, 6))
+    plt.bar(bin_centers, hist, width=180/bins*0.8)
+    plt.xlabel('Angle (degrees)')
+    plt.ylabel('Frequency')
+    plt.title('Directional Distribution of Frequency Components')
+    plt.xticks(np.arange(0, 181, 15))
+    plt.grid(True, alpha=0.3)
+    plt.savefig('directional_histogram.png', dpi=300)
+    plt.show()
+    
+    # Create polar plot of the same data
+    plt.figure(figsize=(10, 10))
+    ax = plt.subplot(111, projection='polar')
+    
+    # Convert to radians for polar plot
+    theta = np.radians(bin_centers)
+    
+    # Plot with 180° symmetry
+    ax.bar(theta, hist, width=np.radians(180/bins)*0.8, alpha=0.7)
+    ax.bar(theta + np.pi, hist, width=np.radians(180/bins)*0.8, alpha=0.7)
+    
+    ax.set_theta_zero_location('N')  # 0° at the top
+    ax.set_theta_direction(-1)  # Clockwise
+    ax.set_rlabel_position(0)
+    ax.set_title("Directional Distribution (Polar)", y=1.08)
+    plt.savefig('directional_polar.png', dpi=300)
+    plt.show()
+    
+    # Find dominant directions
+    threshold = np.mean(hist) + np.std(hist)
+    dominant_indices = np.where(hist > threshold)[0]
+    
+    if len(dominant_indices) > 0:
+        dominant_angles = bin_centers[dominant_indices]
+        dominant_counts = hist[dominant_indices]
+        
+        print("\nDominant Directional Patterns:")
+        for angle, count in zip(dominant_angles, dominant_counts):
+            print(f"- {angle:.1f}° (± {180/bins/2:.1f}°): {count} peaks")
+            
+        # Interpret the directional findings
+        if len(dominant_angles) == 1:
+            print("\nInterpretation: The images show a single dominant directional pattern.")
+            print(f"Features are primarily oriented at {dominant_angles[0]:.1f}° (and {(dominant_angles[0]+90)%180:.1f}°)")
+        elif len(dominant_angles) == 2:
+            diff = abs(dominant_angles[0] - dominant_angles[1])
+            if abs(diff - 90) < 15 or abs(diff - 90) > 165:
+                print("\nInterpretation: The images show orthogonal (perpendicular) patterns.")
+                print(f"Main directions are {dominant_angles[0]:.1f}° and {dominant_angles[1]:.1f}°")
+            else:
+                print("\nInterpretation: The images show two distinct directional patterns.")
+                print(f"Main directions are {dominant_angles[0]:.1f}° and {dominant_angles[1]:.1f}°")
+        else:
+            print("\nInterpretation: The images show multiple directional patterns.")
+            print("This could indicate complex structures or a lack of strong directional consistency.")
+    else:
+        print("\nNo strong directional patterns detected.")
+        print("The images may contain isotropic textures or randomly oriented features.")
+
+def analyze_frequency_distribution(peaks):
+    """Analyze the distribution of frequencies by distance from center."""
+    if not peaks:
+        return
+    
+    # Extract distances from center
+    distances = [p['distance'] for p in peaks]
+    
+    # Create histogram of distances
+    hist, bin_edges = np.histogram(distances, bins=20)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # Plot frequency distribution
+    plt.figure(figsize=(12, 6))
+    plt.bar(bin_centers, hist, width=(bin_edges[1]-bin_edges[0])*0.8)
+    plt.xlabel('Distance from Center (frequency magnitude)')
+    plt.ylabel('Count')
+    plt.title('Distribution of Frequency Magnitudes')
+    plt.grid(True, alpha=0.3)
+    plt.savefig('frequency_distribution.png', dpi=300)
+    plt.show()
+    
+    # Find peaks in the distribution
+    from scipy.signal import find_peaks
+    peak_indices, _ = find_peaks(hist, height=np.mean(hist)*1.2)
+    
+    if len(peak_indices) > 0:
+        peak_distances = bin_centers[peak_indices]
+        
+        print("\nCharacteristic Frequency Magnitudes:")
+        for dist in peak_distances:
+            # Convert to approximate spatial wavelength (in pixels)
+            # Wavelength = image_size / frequency
+            # Distance from center is proportional to frequency
+            # Using a reference image size of 1000 pixels for this estimate
+            approx_wavelength = 1000 / (dist * 2)  # *2 because distance is from center to edge
+            
+            print(f"- Distance {dist:.1f} from center corresponds to features ~{approx_wavelength:.1f} pixels in size")
+        
+        if len(peak_distances) == 1:
+            print("\nInterpretation: The images contain features with a single characteristic scale.")
+        else:
+            print("\nInterpretation: The images contain features at multiple characteristic scales.")
+    else:
+        print("\nNo strong characteristic scales detected.")
+        print("The images may contain features at a wide range of scales or very random textures.")
+
+def main():
+    # Settings
+    folder_path = r"D:\Shwetabh D\boresighting\RESEPI-B2DDC6-2025-02-26-18-31-34\camera"
+    resize_to = (512, 512)  # Resize all images to this size for consistent analysis
+    max_images = None  # Process all images
+    
+    # Process images (this will take some time for 100+ images)
+    psds = process_image_folder(folder_path, resize_to, max_images)
+    
+    if not psds:
+        print("No PSDs were generated. Check the image paths and formats.")
+        return
+    
+    # Create summary statistics
+    summary = create_psd_summary(psds)
+    
+    # Visualize summary
+    peaks = visualize_psd_summary(summary)
+    
+    # Analyze directional patterns
+    analyze_directional_patterns(peaks)
+    
+    # Analyze frequency distribution
+    analyze_frequency_distribution(peaks)
+    
+    print("\nAnalysis complete! Check the generated PNG files for visualizations.")
+
+if __name__ == "__main__":
+    main()
