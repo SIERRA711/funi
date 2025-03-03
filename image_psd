@@ -1,0 +1,372 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from scipy import fftpack
+from PIL import Image
+import glob
+
+def calculate_2d_psd(image):
+    """Calculate 2D power spectral density of an image."""
+    # Convert to grayscale if it's a color image
+    if len(image.shape) == 3:
+        image = np.mean(image, axis=2)
+    
+    # Apply Hann window to reduce edge effects
+    h_window = np.hanning(image.shape[0])
+    v_window = np.hanning(image.shape[1])
+    window = np.outer(h_window, v_window)
+    
+    # Apply window and compute FFT
+    windowed_img = image * window
+    
+    # Compute 2D FFT
+    f_transform = fftpack.fft2(windowed_img)
+    
+    # Shift zero frequency to center
+    f_transform_shifted = fftpack.fftshift(f_transform)
+    
+    # Calculate power spectrum (magnitude squared)
+    power_spectrum = np.abs(f_transform_shifted)**2
+    
+    return power_spectrum
+
+def analyze_image_folder(folder_path, max_images=10):
+    """Analyze all images in a folder and calculate their PSDs."""
+    # Print all files in directory to debug
+    print(f"Listing all files in directory: {folder_path}")
+    all_files = os.listdir(folder_path)
+    print(f"Found {len(all_files)} total files")
+    
+    # Filter for image files (case insensitive)
+    image_files = []
+    for file in all_files:
+        file_lower = file.lower()
+        if file_lower.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
+            image_files.append(os.path.join(folder_path, file))
+    
+    print(f"Found {len(image_files)} image files")
+    
+    # Limit to max_images to avoid processing too many
+    if len(image_files) > max_images:
+        print(f"Limiting analysis to {max_images} images.")
+        image_files = image_files[:max_images]
+    
+    results = []
+    
+    for img_path in image_files:
+        try:
+            # Load the image
+            print(f"Attempting to load: {img_path}")
+            img = np.array(Image.open(img_path))
+            
+            # Calculate PSD
+            psd = calculate_2d_psd(img)
+            
+            # Store results
+            filename = os.path.basename(img_path)
+            results.append({
+                'filename': filename,
+                'image': img,
+                'psd': psd
+            })
+            
+            print(f"Successfully processed: {filename}")
+            
+        except Exception as e:
+            print(f"Error processing {img_path}: {e}")
+    
+    return results
+
+def find_dominant_frequencies(psd, n_peaks=5):
+    """Find the dominant frequency components in the PSD."""
+    # Create coordinate grid
+    h, w = psd.shape
+    y_coords, x_coords = np.ogrid[:h, :w]
+    
+    # Get coordinates relative to center (DC component)
+    center_y, center_x = h // 2, w // 2
+    y_rel = y_coords - center_y
+    x_rel = x_coords - center_x
+    
+    # Calculate distance from center (frequency magnitude)
+    dist_from_center = np.sqrt(y_rel**2 + x_rel**2)
+    
+    # Mask out the DC component (center point)
+    mask = np.ones_like(psd, dtype=bool)
+    mask[center_y, center_x] = False
+    masked_psd = psd.copy()
+    masked_psd[~mask] = 0
+    
+    # Find peak positions
+    flat_indices = np.argsort(masked_psd.flatten())[-n_peaks:]
+    peak_indices = np.unravel_index(flat_indices, psd.shape)
+    
+    peaks = []
+    for y, x in zip(peak_indices[0], peak_indices[1]):
+        # Calculate frequency in cycles per image
+        freq_y = abs(y - center_y) / h
+        freq_x = abs(x - center_x) / w
+        
+        # Calculate angle (direction)
+        angle = np.arctan2(y - center_y, x - center_x) * 180 / np.pi
+        
+        # Calculate magnitude
+        magnitude = masked_psd[y, x]
+        
+        # Distance from center (frequency magnitude)
+        distance = dist_from_center[y, x]
+        
+        peaks.append({
+            'position': (y, x),
+            'freq_y': freq_y,
+            'freq_x': freq_x,
+            'angle': angle,
+            'magnitude': magnitude,
+            'distance': distance
+        })
+    
+    # Sort by magnitude
+    peaks.sort(key=lambda x: x['magnitude'], reverse=True)
+    
+    return peaks
+
+def plot_results(results, output_folder=None):
+    """Plot the images and their PSDs with analysis."""
+    if not results:
+        print("No results to plot.")
+        return
+        
+    for i, result in enumerate(results):
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Original image
+        if len(result['image'].shape) == 3:
+            axes[0].imshow(result['image'])
+        else:
+            axes[0].imshow(result['image'], cmap='gray')
+        axes[0].set_title(f"Original: {result['filename']}")
+        axes[0].axis('off')
+        
+        # PSD in log scale
+        psd_log = np.log10(result['psd'] + 1)  # Add 1 to avoid log(0)
+        im = axes[1].imshow(psd_log, cmap='viridis')
+        axes[1].set_title("Power Spectral Density (log scale)")
+        plt.colorbar(im, ax=axes[1])
+        
+        # PSD with peaks highlighted
+        peaks = find_dominant_frequencies(result['psd'])
+        axes[2].imshow(psd_log, cmap='viridis')
+        
+        # Mark the center (DC component)
+        center_y, center_x = result['psd'].shape[0] // 2, result['psd'].shape[1] // 2
+        axes[2].plot(center_x, center_y, 'r+', markersize=15)
+        
+        # Plot the peak points
+        for j, peak in enumerate(peaks):
+            y, x = peak['position']
+            axes[2].plot(x, y, 'ro', markersize=8, alpha=0.7)
+            axes[2].text(x+5, y+5, f"{j+1}", color='white', fontsize=12, 
+                        bbox=dict(facecolor='red', alpha=0.5))
+        
+        axes[2].set_title("Dominant Frequency Components")
+        
+        # Add frequency peak information as text
+        peak_info = "\n".join([
+            f"Peak {j+1}: Freq=({p['freq_x']:.3f}, {p['freq_y']:.3f}), "
+            f"Angle={p['angle']:.1f}°, Dist={p['distance']:.1f}"
+            for j, p in enumerate(peaks)
+        ])
+        
+        plt.figtext(0.5, 0.01, peak_info, ha="center", fontsize=10, 
+                   bbox={"facecolor":"orange", "alpha":0.5, "pad":5})
+        
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.2)  # Make room for the text
+        
+        if output_folder:
+            os.makedirs(output_folder, exist_ok=True)
+            plt.savefig(os.path.join(output_folder, f"psd_analysis_{i+1}_{result['filename']}.png"))
+        
+        plt.show()
+
+def calculate_average_psd(results):
+    """Calculate the average PSD across all images."""
+    if not results:
+        print("No results to calculate average PSD.")
+        return None
+        
+    # Ensure all PSDs have the same shape
+    psd_shapes = [r['psd'].shape for r in results]
+    if len(set(psd_shapes)) > 1:
+        print("Warning: Images have different sizes. Resizing PSDs for averaging.")
+        # Find the smallest dimensions
+        min_h = min(shape[0] for shape in psd_shapes)
+        min_w = min(shape[1] for shape in psd_shapes)
+        
+        # Crop PSDs to the same size
+        psds = [r['psd'][:min_h, :min_w] for r in results]
+    else:
+        psds = [r['psd'] for r in results]
+    
+    # Average the PSDs
+    avg_psd = np.mean(psds, axis=0)
+    
+    return avg_psd
+
+def analyze_psd_patterns(results):
+    """Analyze patterns and features across all PSDs."""
+    if not results:
+        print("No results to analyze patterns.")
+        return None
+        
+    # Calculate average PSD
+    avg_psd = calculate_average_psd(results)
+    if avg_psd is None:
+        return None
+    
+    # Find dominant frequencies in the average PSD
+    avg_peaks = find_dominant_frequencies(avg_psd, n_peaks=8)
+    
+    # Plot the average PSD
+    plt.figure(figsize=(10, 8))
+    plt.imshow(np.log10(avg_psd + 1), cmap='viridis')
+    
+    # Mark the center (DC component)
+    center_y, center_x = avg_psd.shape[0] // 2, avg_psd.shape[1] // 2
+    plt.plot(center_x, center_y, 'r+', markersize=15)
+    
+    # Plot the peak points
+    for j, peak in enumerate(avg_peaks):
+        y, x = peak['position']
+        plt.plot(x, y, 'ro', markersize=8, alpha=0.7)
+        plt.text(x+5, y+5, f"{j+1}", color='white', fontsize=12, 
+                bbox=dict(facecolor='red', alpha=0.5))
+    
+    plt.colorbar(label='Log Power')
+    plt.title("Average Power Spectral Density Across All Images")
+    
+    # Add peak information
+    peak_info = "\n".join([
+        f"Peak {j+1}: Freq=({p['freq_x']:.3f}, {p['freq_y']:.3f}), "
+        f"Angle={p['angle']:.1f}°, Dist={p['distance']:.1f}"
+        for j, p in enumerate(avg_peaks)
+    ])
+    
+    plt.figtext(0.5, 0.01, peak_info, ha="center", fontsize=10, 
+               bbox={"facecolor":"orange", "alpha":0.5, "pad":5})
+    
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.2)  # Make room for the text
+    plt.show()
+    
+    # Interpret the results
+    interpretations = []
+    
+    # Check for directional patterns
+    angles = [p['angle'] for p in avg_peaks]
+    angle_groups = {}
+    for angle in angles:
+        # Group similar angles (within 15 degrees)
+        for base_angle in range(0, 180, 15):
+            if base_angle <= (angle % 180) < (base_angle + 15):
+                if base_angle not in angle_groups:
+                    angle_groups[base_angle] = 0
+                angle_groups[base_angle] += 1
+    
+    # Find dominant directions
+    dominant_directions = [k for k, v in angle_groups.items() if v >= 2]
+    if dominant_directions:
+        direction_text = ', '.join([f"{d}° to {d+15}°" for d in dominant_directions])
+        interpretations.append(f"Dominant directional patterns at: {direction_text}")
+    
+    # Check for regular spacing (grid-like features)
+    distances = [p['distance'] for p in avg_peaks]
+    similar_distances = []
+    
+    for i, d1 in enumerate(distances):
+        similar_to_d1 = [j for j, d2 in enumerate(distances) if abs(d1 - d2) / d1 < 0.1 and i != j]
+        if similar_to_d1:
+            similar_distances.append((i, similar_to_d1))
+    
+    if similar_distances:
+        interpretations.append("Regular spacing detected - may indicate grid-like features or regular patterns")
+    
+    # Check for strong vs. weak frequency structure
+    dc_value = avg_psd[center_y, center_x]
+    max_non_dc = np.max(avg_psd[avg_psd != dc_value])
+    ratio = max_non_dc / dc_value
+    
+    if ratio > 0.01:
+        interpretations.append("Strong frequency components detected - distinct patterns or structures present")
+    else:
+        interpretations.append("Weak frequency structure - images may be more random or noise-like")
+    
+    # Check for radial patterns (circular symmetry)
+    y_coords, x_coords = np.ogrid[:avg_psd.shape[0], :avg_psd.shape[1]]
+    y_rel = y_coords - center_y
+    x_rel = x_coords - center_x
+    dist_from_center = np.sqrt(y_rel**2 + x_rel**2)
+    
+    # Create distance bins
+    max_dist = np.max(dist_from_center)
+    bins = 20
+    bin_edges = np.linspace(0, max_dist, bins+1)
+    radial_avg = np.zeros(bins)
+    
+    for i in range(bins):
+        mask = (dist_from_center >= bin_edges[i]) & (dist_from_center < bin_edges[i+1])
+        if np.any(mask):
+            radial_avg[i] = np.mean(avg_psd[mask])
+    
+    # Plot radial average
+    plt.figure(figsize=(10, 6))
+    plt.plot(bin_edges[:-1], radial_avg)
+    plt.xlabel('Distance from center (frequency magnitude)')
+    plt.ylabel('Average power')
+    plt.title('Radial Average of PSD')
+    plt.grid(True)
+    plt.show()
+    
+    # Check for peaks in radial average
+    from scipy.signal import find_peaks
+    peaks, _ = find_peaks(radial_avg, height=np.mean(radial_avg)*1.5)
+    
+    if len(peaks) > 0:
+        peak_distances = bin_edges[peaks]
+        interpretations.append(f"Radial peaks detected at distances: {', '.join([f'{d:.1f}' for d in peak_distances])}")
+        interpretations.append("These may correspond to regular structures with characteristic sizes")
+    
+    print("\nPattern Analysis Interpretations:")
+    for interp in interpretations:
+        print(f"- {interp}")
+    
+    return {
+        'average_psd': avg_psd,
+        'peaks': avg_peaks,
+        'interpretations': interpretations
+    }
+
+# Main function to run the analysis
+def main(folder_path, output_folder=None, max_images=20):
+    print(f"Analyzing UAV images in: {folder_path}")
+    results = analyze_image_folder(folder_path, max_images)
+    
+    if not results:
+        print("No images were successfully processed.")
+        return
+    
+    print("\nGenerating visualizations...")
+    plot_results(results, output_folder)
+    
+    print("\nAnalyzing patterns across all images...")
+    analysis = analyze_psd_patterns(results)
+    
+    print("\nAnalysis complete!")
+
+# Example usage
+if __name__ == "__main__":
+    # Replace with your folder path
+    folder_path = r"D:\Shwetabh D\boresighting\RESEPI-B2DDC6-2025-02-26-18-31-34\camera"  # Using raw string to handle Windows paths
+    output_folder = "psd_analysis_results"
+    main(folder_path, output_folder)
